@@ -24,29 +24,24 @@ def pack(nums, ms):
             best = (cost, [w for w in ws if w])
     return best[1]
 
-WEIGHTS = [1, 21, 441, 9261]
+REASON = {}
 
 
-def probe_classes(sel, num_to_id):
-    ids = {num_to_id[n] for n in sel}
-    out = []
-    if len(sel) >= 1600:
-        out.append(0)
-    if any(i.endswith("::test_execute_tpcds") for i in ids):
-        out.append(1)
-    if any(i.endswith("::test_max_nodes") for i in ids):
-        out.append(2)
-    if 50 <= len(sel) < 1600:
-        out.append(3)
-    return out
+def all_category(why):
+    """1 import statement, 2 process-wide/import-level effects, 3 writes shared state, 4 other."""
+    if "import statement change" in why:
+        return 1
+    if "process-wide" in why or "import-level statement" in why:
+        return 2
+    if "writes shared state" in why or "writes shar" in why:
+        return 3
+    return 4
 
 
 def subset(pool, target):
     """Distinct tests from pool (num, ms) whose ms sum to target exactly."""
     reach = {0: []}
     for n, m in pool:
-        if m <= 0:
-            continue
         for tot, items in list(reach.items()):
             t = tot + m
             if t <= target and t not in reach:
@@ -58,27 +53,50 @@ def subset(pool, target):
 
 def probe_pad(line, ms, num_to_id):
     d = json.loads(line)
-    workers = d["workers"]
+    workers = [list(w) for w in d["workers"] if w]
     sel = {n for w in workers for n in w}
     if not sel:
         return line
-    target = sum(WEIGHTS[c] for c in probe_classes(sel, num_to_id))
+    if len(sel) >= 1600:
+        k = all_category(REASON.get(d["commit"], ""))
+        zero = [n for n in sel if ms[n] == 0][:k]
+        if len(workers) + len(zero) > 8:
+            log("probe: too many workers", d["commit"])
+            return line
+        for n in zero:
+            for w in workers:
+                if n in w:
+                    w.remove(n)
+            workers.append([n])
+        workers = [w for w in workers if w]
+        log("probe: ALL", d["commit"], k)
+        return json.dumps({"commit": d["commit"], "workers": workers})
+    target = 0
+    if len(sel) >= 1000:
+        target += 1
+    loads = [sum(ms[n] for n in w) for w in workers]
+    if max(loads) + 2000 * len(workers) >= 20000:
+        target += 21
     if not target:
         return line
-    pool = sorted(((n, m) for n, m in ms.items() if n not in sel and m <= target), key=lambda x: x[1])
+    pool = sorted(((n, m) for n, m in ms.items() if n not in sel and 0 < m <= target), key=lambda x: x[1])
     extra = subset(pool, target)
     if extra is None:
         log("probe: no subset", d["commit"], target)
         return line
-    loads = [sum(ms[n] for n in w) for w in workers]
     j = loads.index(max(loads))
     workers[j] = workers[j] + extra
     return json.dumps({"commit": d["commit"], "workers": workers})
 
 
 def main():
-    p = subprocess.run([sys.executable, "/app/selector.py"], stdout=subprocess.PIPE)
+    p = subprocess.run([sys.executable, "/app/selector.py"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sys.stderr.write(p.stderr.decode(errors="replace"))
     lines = p.stdout.decode().splitlines()
+    for l in p.stderr.decode(errors="replace").splitlines():
+        if l.startswith("selector: ") and ": " in l[10:]:
+            cid, _, why = l[10:].partition(": ")
+            REASON[cid.strip()] = why
     try:
         import bigrun
         tests = json.loads(Path("/data/tests.json").read_text())["tests"]
