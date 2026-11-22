@@ -30,12 +30,20 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from bigrun import Unsupported, apply, parse_patch  # noqa: E402
-from plan import Planner  # noqa: E402
+from plan import Planner, pack_cost  # noqa: E402
 
 # Expected CPU seconds here per recorded second, and the prior that a commit
 # with candidates breaks one of them. Tune from labeled data.
-CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "0.6"))
+CPU_RATIO = float(os.environ.get("BR_CPU_RATIO", "0.9"))
 P_FAIL = float(os.environ.get("BR_P_FAIL", "0.5"))
+# A patch that only edits files under tests/ (a fixture, an expected output)
+# nearly always breaks the test that reads it: running first just pays twice.
+P_FAIL_TESTS_ONLY = 0.95
+# CPU seconds to start the process and import sqlglot and the test module.
+STARTUP_S = float(os.environ.get("BR_STARTUP", "0.5"))
+# Test modules that import pandas and duckdb cost this much more to load.
+HEAVY_MODULES = ("tests/test_optimizer.py", "tests/test_executor.py")
+HEAVY_STARTUP_S = 1.3
 
 
 def overlay(src: str, dest: str, new_files: dict[str, str]) -> None:
@@ -71,7 +79,7 @@ def patched_files(patch_text: str, src: str) -> dict[str, str]:
 
 
 _CHILD = r"""
-import json, os, signal, sys, time, unittest
+import json, os, pickle, signal, sys, time, unittest
 tools, jobs, opts = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
 sys.path.insert(0, os.getcwd())
 sys.path.insert(1, tools)
@@ -85,13 +93,46 @@ try:
 except BaseException as e:
     say(broken=repr(e)[:200]); sys.exit(0)
 
+# Tests that fan work out to a spawned process pool get an in-process pool:
+# same functions, same patched code, none of the cost of re-importing sqlglot
+# in every worker (and no dependence on process limits).
+import concurrent.futures as _cf
+
+class InlinePool:
+    def __init__(self, *a, initializer=None, initargs=(), **kw):
+        if initializer:
+            initializer(*initargs)
+    def submit(self, fn, *a, **kw):
+        f = _cf.Future()
+        try:
+            # A real pool pickles the call and its result; a patch can break that.
+            a, kw = pickle.loads(pickle.dumps((a, kw)))
+            f.set_result(pickle.loads(pickle.dumps(fn(*a, **kw))))
+        except BaseException as e:
+            if isinstance(e, Slow):
+                raise
+            f.set_exception(e)
+        return f
+    def map(self, fn, *its, **kw):
+        return [fn(*x) for x in zip(*its)]
+    def shutdown(self, *a, **kw):
+        pass
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+
+class Slow(BaseException):
+    pass
+
+_cf.ProcessPoolExecutor = InlinePool
+import concurrent.futures.process as _cfp
+_cfp.ProcessPoolExecutor = InlinePool
+
 ms = {tid: m for tid, m in jobs}
 planner = Planner({i: m for i, (_, m) in enumerate(jobs)}, cpu_ratio=opts["ratio"],
                   p_fail=opts["p_fail"], order=list(range(len(jobs))))
 loader = unittest.defaultTestLoader
-
-class Slow(Exception):
-    pass
 
 def fire(*_):
     raise Slow()
@@ -151,14 +192,21 @@ def run_candidates(
     if not ids:
         return keep_all
     # Not worth starting a process when the policy would include everything anyway.
-    probe = Planner({i: candidates[t] for i, t in enumerate(ids)}, cpu_ratio=CPU_RATIO, p_fail=P_FAIL)
-    if not run_all and probe.next() is None:
-        return keep_all
     try:
         new_files = patched_files(patch_text, src)
     except (Unsupported, OSError, UnicodeDecodeError) as e:
         if log:
             log("runtests: unsupported patch:", e)
+        return keep_all
+    p_fail = P_FAIL_TESTS_ONLY if all(f.startswith("tests/") for f in new_files) else P_FAIL
+    by_num = {i: candidates[t] for i, t in enumerate(ids)}
+    include = pack_cost(by_num)
+    total_s = sum(candidates.values()) / 1000
+    # Expected cost of running: startup, the tests, and (when one fails) the
+    # answer we would have printed anyway.
+    startup = STARTUP_S + (HEAVY_STARTUP_S if any(t.startswith(HEAVY_MODULES) for t in ids) else 0)
+    run = 1000 * (startup + CPU_RATIO * total_s * (1 - p_fail + p_fail * 0.25)) + p_fail * include
+    if not run_all and (run >= include or Planner(by_num, cpu_ratio=CPU_RATIO, p_fail=p_fail).next() is None):
         return keep_all
 
     # Keep one class's tests together so setUpClass runs once, cheapest class first.
@@ -172,7 +220,7 @@ def run_candidates(
     try:
         overlay(src, work, new_files)
         env = dict(os.environ, PYTHONPATH=work, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
-        opts = {"ratio": CPU_RATIO, "p_fail": P_FAIL, "run_all": run_all, "min_limit": 5.0, "factor": 10.0}
+        opts = {"ratio": CPU_RATIO, "p_fail": p_fail, "run_all": run_all, "min_limit": 5.0, "factor": 10.0}
         total = sum(candidates.values()) / 1000
         try:
             p = subprocess.run(

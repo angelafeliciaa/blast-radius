@@ -363,13 +363,20 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
     # Pass 2: really execute what is left, cheapest first.
     heavy.sort(key=lambda x: x[:2])
     left = sum(h[0] for h in heavy) / 1000  # recorded seconds still to execute
-    if left > budget_s:  # hopeless even at the recorded speed
+    # CPU seconds here per recorded second. The recorded times were taken on a
+    # busy machine; an idle one needs about 0.65 of them. Re-learned below.
+    speed = 0.65
+    if left * speed > budget_s:  # hopeless even at the best speed seen
         return UNKNOWN
-    speed = 1.0  # CPU seconds here per recorded second, learned as we go
     done_rec = done_cpu = 0.0
     for ms, i, names, plan in heavy:
         spent = time.process_time() - start
         if spent + left * speed > budget_s:
+            return UNKNOWN
+        try:
+            for n in names:  # loading data is not part of the query's speed
+                _table(suite, n)
+        except BaseException:
             return UNKNOWN
         t0 = time.process_time()
         try:
@@ -381,7 +388,7 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
         left -= ms / 1000
         done_rec += ms / 1000
         done_cpu += time.process_time() - t0
-        if done_rec > 0.05:
+        if done_rec > 0.5:
             speed = max(done_cpu / done_rec, 0.2)
     return PASS
 

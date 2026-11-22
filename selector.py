@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "tools"))
 import bigrun  # noqa: E402
+import runtests  # noqa: E402
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/sqlglot"))
@@ -553,6 +554,17 @@ def main() -> None:
                     sel -= {big[t] for t, x in v.items() if x == "pass"}
                 except Exception as e:
                     log(patch.stem, "bigrun error", repr(e))
+            small = {num_to_id[n]: s.ms[n] for n in sel if num_to_id[n] not in bigrun.BIG}
+            if small and not any(num_to_id[n] in bigrun.BIG for n in sel):
+                try:
+                    r = runtests.run_candidates(text, small, src=str(SRC), log=log)
+                    if r.get("all"):
+                        sel = set(s.all_tests)
+                    else:
+                        sel -= {s.by_id[t] for t in r.get("drop", [])}
+                    log(patch.stem, "runtests ran", r.get("ran"), "cpu", r.get("cpu"), "dropped", len(r.get("drop", [])))
+                except Exception as e:
+                    log(patch.stem, "runtests error", repr(e))
         except Exception as e:  # never crash: fall back to everything
             log(patch.stem, "ERROR", repr(e))
             sel, why = set(s.all_tests), []

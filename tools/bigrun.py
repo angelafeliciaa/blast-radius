@@ -40,7 +40,7 @@ BUDGET = {
     bigchecks.GEN_MEMORY: 5.0,
     bigchecks.EXEC_TPCH: 3.0,
     bigchecks.OPT_TPCH: 3.0,
-    bigchecks.EXEC_TPCDS: 12.0,
+    bigchecks.EXEC_TPCDS: 20.0,
 }
 # Cheapest first; the child stops being useful once sqlglot fails to import.
 ORDER = [
