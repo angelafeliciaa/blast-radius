@@ -40,7 +40,7 @@ BUDGET = {
     bigchecks.GEN_MEMORY: 5.0,
     bigchecks.EXEC_TPCH: 3.0,
     bigchecks.OPT_TPCH: 3.0,
-    bigchecks.EXEC_TPCDS: 20.0,
+    bigchecks.EXEC_TPCDS: float(os.environ.get("BR_TPCDS_BUDGET", "12")),
 }
 # Cheapest first; the child stops being useful once sqlglot fails to import.
 ORDER = [
@@ -50,6 +50,50 @@ ORDER = [
     bigchecks.GEN_MEMORY,
     bigchecks.EXEC_TPCDS,
 ]
+
+# The scorer charges about this many seconds per CPU second measured where
+# the maps were built (BR_CPU_FACTOR). A check only runs when the simulated
+# seconds it is expected to save exceed what its CPU will be charged.
+CPU_FACTOR = float(os.environ.get("BR_CPU_FACTOR", "4.5"))
+P_PASS = 0.6  # share of selected slow tests that turn out to pass
+RECORDED_S = {
+    bigchecks.MAX_NODES: 28.817,
+    bigchecks.EXEC_TPCDS: 21.454,
+    bigchecks.GEN_MEMORY: 6.686,
+    bigchecks.EXEC_TPCH: 3.863,
+    bigchecks.OPT_TPCH: 3.537,
+}
+START_S = 0.35  # process start and importing sqlglot
+FIXED_S = {
+    bigchecks.MAX_NODES: 0.15,
+    bigchecks.GEN_MEMORY: 1.0,
+}
+
+
+def plan_checks(wanted, changed, saving=None):
+    """Which checks pay for themselves, with the CPU budget each may use.
+
+    `saving` maps a test to the simulated seconds its removal saves (default:
+    its recorded seconds, an upper bound).
+    """
+    chosen = {}
+    cost = 0.0
+    gain = 0.0
+    for t in wanted:
+        worth = P_PASS * (saving or RECORDED_S).get(t, RECORDED_S[t])
+        if t in FIXED_S:
+            est = FIXED_S[t]
+        else:
+            suite = "tpcds" if t == bigchecks.EXEC_TPCDS else "tpch"
+            est = bigchecks.tpc_estimate(suite, changed, executes=t != bigchecks.OPT_TPCH)
+        if CPU_FACTOR * est < worth:
+            chosen[t] = min(BUDGET[t], worth / CPU_FACTOR)
+            cost += est
+            gain += worth
+    if gain <= CPU_FACTOR * (START_S + cost):
+        return {}
+    return chosen
+
 
 _HUNK = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -144,6 +188,28 @@ def apply(old_lines: list[str], hunks) -> tuple[list[str], set[int]]:
     return out, touched
 
 
+_PLAIN_DECORATORS = {"staticmethod", "classmethod", "property"}
+
+
+def memoized(source: str, touched: set[int]) -> bool:
+    """True when a touched line is inside a function with a decorator that may
+    cache its result (anything but staticmethod/classmethod/property). A cached
+    result is reused later without running the function's lines, so a line map
+    cannot say where its effect ends."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return True
+    for f in ast.walk(tree):
+        if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.decorator_list:
+            if any(f.lineno <= line <= f.end_lineno for line in touched):
+                for d in f.decorator_list:
+                    name = d.id if isinstance(d, ast.Name) else None
+                    if name not in _PLAIN_DECORATORS:
+                        return True
+    return False
+
+
 def statement_lines(source: str, touched: set[int]) -> set[int] | None:
     """Widen touched lines to the statements holding them.
 
@@ -179,6 +245,64 @@ def statement_lines(source: str, touched: set[int]) -> set[int] | None:
         else:
             out.update(range(best.lineno, best.end_lineno + 1))
     return out
+
+
+# Fixture files the five slow tests never open: the TPC ones are under
+# optimizer/tpc-h/ and optimizer/tpc-ds/, and nothing else is read by them.
+_OTHER_FIXTURES = "tests/fixtures/"
+_TPC_FIXTURES = ("tests/fixtures/optimizer/tpc-h/", "tests/fixtures/optimizer/tpc-ds/")
+
+
+def _irrelevant(rel: str) -> bool:
+    return (
+        rel.startswith(_OTHER_FIXTURES)
+        and not rel.startswith(_TPC_FIXTURES)
+        and not rel.endswith(".py")
+    )
+
+
+def default_only(old: str, new: str) -> set[int] | None:
+    """When the only difference is constant default values in def headers,
+    the body lines of those functions; otherwise None.
+
+    A default is read when the function is called without that argument, and a
+    call runs the body, so the edit reaches exactly what runs those lines.
+    """
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return None
+    fa = [n for n in ast.walk(a) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    fb = [n for n in ast.walk(b) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    if len(fa) != len(fb):
+        return None
+    lines: set[int] = set()
+    for x, y in zip(fa, fb):
+        dx = x.args.defaults + [d for d in x.args.kw_defaults if d is not None]
+        dy = y.args.defaults + [d for d in y.args.kw_defaults if d is not None]
+        if len(dx) != len(dy):
+            return None
+        differs = False
+        for u, v in zip(dx, dy):
+            if ast.dump(u) != ast.dump(v):
+                if not (isinstance(u, ast.Constant) and isinstance(v, ast.Constant)):
+                    return None
+                differs = True
+        if differs:
+            if x.decorator_list:
+                return None  # a decorator may read the defaults when the module loads
+            lines.update(range(x.body[0].lineno, x.end_lineno + 1))
+    if not lines:
+        return None
+    # Everything else must be identical: blank the constant defaults and compare.
+    for tree in (a, b):
+        for n in ast.walk(tree):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                n.args.defaults = [ast.Constant(0) if isinstance(d, ast.Constant) else d for d in n.args.defaults]
+                n.args.kw_defaults = [
+                    ast.Constant(0) if isinstance(d, ast.Constant) else d for d in n.args.kw_defaults
+                ]
+    return lines if ast.dump(a) == ast.dump(b) else None
 
 
 def _same_code(old: str, new: str) -> bool:
@@ -233,6 +357,7 @@ def verdicts(
     src: str = "/sqlglot",
     tmp: str | None = None,
     log=None,
+    saving: dict[str, float] | None = None,
 ) -> dict[str, str]:
     """{test_id: "fail" | "pass" | "unknown"} for the slow tests in test_ids."""
     wanted = [t for t in ORDER if t in set(test_ids)]
@@ -244,8 +369,11 @@ def verdicts(
         if not files:
             raise Unsupported("no files")
         new_files: dict[str, str] = {}
-        changed: dict[str, list[int]] | None = {}
+        changed: dict[str, list[int] | None] = {}
+        cached = False
         for rel, hunks in files.items():
+            if _irrelevant(rel):
+                continue  # a file none of the five tests reads
             if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
                 raise Unsupported(f"outside sqlglot/*.py: {rel}")
             old_text = open(os.path.join(src, rel)).read()
@@ -254,26 +382,36 @@ def verdicts(
             new_files[rel] = "\n".join(new_lines)
             if _same_code(old_text, new_files[rel]):
                 continue  # comments or layout only: nothing sqlglot runs changed
-            if changed is not None:
-                lines = statement_lines(old_text, touched)
-                if lines is None:
-                    changed = None
-                else:
-                    changed[rel] = sorted(lines)
+            lines = statement_lines(old_text, touched)
+            if lines is None:
+                lines = default_only(old_text, new_files[rel])
+            if memoized(old_text, touched):
+                cached = True
+            # None: the edit is in code that runs at import.
+            changed[rel] = None if lines is None else sorted(lines)
     except (Unsupported, OSError, UnicodeDecodeError) as e:
         if log:
             log("bigrun: unsupported patch:", e)
         return result
-    if changed is not None and not changed:
+    if not changed:
         return {t: bigchecks.PASS for t in wanted}
+    if cached:
+        changed["#cached"] = []  # tells the checks not to reason stage by stage
+
+    budgets = plan_checks(wanted, changed, saving)
+    if log and len(budgets) < len(wanted):
+        log("bigrun: not worth checking:", [t.split("::")[-1] for t in wanted if t not in budgets])
+    wanted = [t for t in wanted if t in budgets]
+    if not wanted:
+        return result
 
     work = tempfile.mkdtemp(prefix="brbig", dir=tmp)
     try:
         _overlay(src, work, new_files)
-        jobs = [[t, changed, BUDGET[t]] for t in wanted]
+        jobs = [[t, changed, budgets[t]] for t in wanted]
         env = dict(os.environ, PYTHONPATH=f"{work}{os.pathsep}{src}", SKIP_INTEGRATION="0",
                    PYTHONDONTWRITEBYTECODE="1")
-        limit = 20 + 3 * sum(BUDGET[t] for t in wanted)
+        limit = 20 + 3 * sum(budgets.values())
         start = time.time()
         try:
             p = subprocess.run(
@@ -300,7 +438,8 @@ def verdicts(
         if log:
             log("bigrun:", {t.split("::")[-1]: v for t, v in result.items()},
                 f"{time.time() - start:.2f}s wall",
-                "all-lines" if changed is None else sum(len(v) for v in changed.values()))
+                "import-time" if any(v is None for v in changed.values())
+                else sum(len(v) for v in changed.values()))
     finally:
         shutil.rmtree(work, ignore_errors=True)
     return result

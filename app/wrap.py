@@ -2,7 +2,7 @@
 import json, subprocess, sys
 from pathlib import Path
 sys.path.insert(0, "/app/br/tools")
-PROBE = True  # diagnostic: pad selections by class weights (no tests removed)
+PROBE = False
 
 def log(*a):
     print(*a, file=sys.stderr)
