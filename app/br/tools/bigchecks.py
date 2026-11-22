@@ -49,6 +49,8 @@ def load_map(path: str | None = None) -> dict:
     if _map is None:
         with gzip.open(path or _MAP_PATH, "rt") as fh:
             _map = json.load(fh)
+        for suite in _map.values():
+            suite["setup"] = {k: set(v) for k, v in suite["setup"].items()}
     return _map
 
 
@@ -254,32 +256,52 @@ def plan_fingerprint(optimized, plan) -> str:
     return _h("\n".join(parts))
 
 
-def plan_query(suite: str, expression):
-    """The part of sqlglot.executor.execute before any row is read."""
-    from sqlglot.executor.table import Table, ensure_tables
-    from sqlglot.optimizer import optimize
-    from sqlglot.planner import Plan
-    from sqlglot.schema import ensure_schema
+class _Stop(BaseException):
+    pass
+
+
+def exec_query(suite: str, expression, full: bool, on_exec=None):
+    """Call the real sqlglot.executor.execute the way the test's worker does.
+
+    Returns (plan fingerprint, result hash). With full=False it stops where
+    execute() hands the plan to PythonExecutor, before any row is read, and the
+    result hash is None. The fingerprint is None when execute() never got there.
+    """
+    import importlib
+
     from sqlglot import find_tables
     from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA
 
-    raw = TPCDS_SCHEMA if suite == "tpcds" else TPCH_SCHEMA
-    names = [t.name for t in find_tables(expression)]
-    ensure_tables({n: Table(columns=raw[n], rows=[]) for n in names})
-    schema = ensure_schema(raw)
-    optimized = optimize(expression, schema, leave_tables_isolated=True)
-    plan = Plan(optimized)
-    return names, plan, plan_fingerprint(optimized, plan)
+    ex = importlib.import_module("sqlglot.executor")
+    schema = TPCDS_SCHEMA if suite == "tpcds" else TPCH_SCHEMA
+    tables = {}
+    for t in find_tables(expression):
+        tables[t.name] = _table(suite, t.name)
 
+    real = ex.PythonExecutor
+    box: dict = {}
 
-def run_plan(suite: str, names, plan):
-    from sqlglot.executor.python import PythonExecutor
-    from sqlglot.executor.table import ensure_tables
+    class Shim:
+        def __init__(self, *a, **kw):
+            self.a, self.kw = a, kw
 
-    tables = ensure_tables({n: _table(suite, n) for n in names})
-    out = PythonExecutor(tables=tables).execute(plan)
+        def execute(self, plan):
+            box["fp"] = plan_fingerprint(plan.expression, plan)
+            if not full:
+                raise _Stop()
+            if on_exec:
+                on_exec()
+            return real(*self.a, **self.kw).execute(plan)
+
+    ex.PythonExecutor = Shim
+    try:
+        out = ex.execute(expression, schema=schema, tables=tables)
+    except _Stop:
+        return box["fp"], None
+    finally:
+        ex.PythonExecutor = real
     out = pickle.loads(pickle.dumps(out))
-    return _h((out.columns, out.rows))
+    return box.get("fp"), _h((out.columns, out.rows))
 
 
 def _hits(per_line: dict, nums, slot: int) -> set[int]:
@@ -293,13 +315,21 @@ def _hits(per_line: dict, nums, slot: int) -> set[int]:
 
 def affected(suite: str, changed) -> tuple[list[int], set[int]] | None:
     """(queries whose recorded lines the patch touches, those touched while
-    rows are being executed). None = assume all of them."""
+    rows are being executed). None = assume all of them.
+
+    A touched line that ran while sqlglot was imported or the tables were
+    loaded can change any query, so it also gives None.
+    """
     if changed is None:
         return None
-    lines = load_map()[suite]["lines"]
+    m = load_map()[suite]
+    lines, setup = m["lines"], m["setup"]
     plan: set[int] = set()
     execs: set[int] = set()
     for path, nums in changed.items():
+        early = setup.get(path)
+        if early and not early.isdisjoint(nums):
+            return None
         per = lines.get(path)
         if per:
             plan |= _hits(per, nums, 0)
@@ -353,10 +383,10 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
                 if optimized and _h(transpile(opt, write="duckdb")[0]) != rec["duck_opt"]:
                     return FAIL
                 if runs:
-                    names, plan, fp = plan_query(suite, expression)
-                    same = rec.get("plan") is not None and fp == rec["plan"]
+                    fp, _ = exec_query(suite, expression, full=False)
+                    same = fp is not None and fp == rec.get("plan")
                     if not same or in_exec is None or i in in_exec:
-                        heavy.append((rec["ms"], i, names, plan))
+                        heavy.append((rec["ms"], i, expression))
         except BaseException:
             return FAIL
 
@@ -369,19 +399,14 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
     if left * speed > budget_s:  # hopeless even at the best speed seen
         return UNKNOWN
     done_rec = done_cpu = 0.0
-    for ms, i, names, plan in heavy:
+    for ms, i, expression in heavy:
         spent = time.process_time() - start
         if spent + left * speed > budget_s:
-            return UNKNOWN
-        try:
-            for n in names:  # loading data is not part of the query's speed
-                _table(suite, n)
-        except BaseException:
             return UNKNOWN
         t0 = time.process_time()
         try:
             with _limit(max(5.0, 20 * ms / 1000)):
-                if run_plan(suite, names, plan) != recorded[i]["res"]:
+                if exec_query(suite, expression, full=True)[1] != recorded[i]["res"]:
                     return FAIL
         except BaseException:
             return FAIL
