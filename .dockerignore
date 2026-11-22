@@ -1,1 +1,6 @@
+.work
 .git
+output.jsonl
+sample
+**/__pycache__
+bench

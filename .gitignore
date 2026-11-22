@@ -1,1 +1,6 @@
+output.jsonl
+.work/
 __pycache__/
+bench/sqlglot/
+bench/proxy/sqlglot/
+bench/proxy/work/

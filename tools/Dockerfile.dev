@@ -1,0 +1,10 @@
+# The image tools/gen_raw_maps.sh runs sqlglot's suite in: the labeling environment
+# (same base image and requirements.lock) with the pinned checkout on PYTHONPATH.
+# docker build -f tools/Dockerfile.dev -t br-dev .
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+COPY requirements.lock /build/requirements.lock
+RUN pip install --no-cache-dir --disable-pip-version-check -r /build/requirements.lock
+COPY tools/fetch_sqlglot.py /build/fetch_sqlglot.py
+RUN python /build/fetch_sqlglot.py /opt/sqlglot && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests
+ENV PYTHONPATH=/opt/sqlglot SKIP_INTEGRATION=0
+WORKDIR /opt/sqlglot
