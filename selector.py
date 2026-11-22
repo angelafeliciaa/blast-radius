@@ -14,6 +14,9 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent / "tools"))
+import bigrun  # noqa: E402
+
 DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).parent / "maps" / "map.json.gz"))
@@ -500,7 +503,10 @@ class Selector:
                     n = self.cov_num[i]
                     if n is not None:
                         hits.add(n)
-                hits |= self.mentions(Path(path).name.split(".")[0])
+                stem = Path(path).name.split(".")[0]
+                hits |= self.mentions(f'"{stem}"') | self.mentions(f"'{stem}'") | self.mentions(f"/{stem}")
+                if not hits:
+                    hits |= self.mentions(stem)
                 if not hits:
                     hits |= self.mentions(Path(path).parent.name)
                 why.append(f"{path}: data -> {len(hits)}")
@@ -531,7 +537,16 @@ def main() -> None:
     s = Selector()
     for patch in sorted((DATA / "commits").glob("*.patch")):
         try:
-            sel, why = s.select(patch.read_text())
+            text = patch.read_text()
+            sel, why = s.select(text)
+            num_to_id = {t["number"]: t["id"] for t in s.tests}
+            big = {num_to_id[n]: n for n in sel if num_to_id[n] in bigrun.BIG}
+            if big:
+                try:
+                    v = bigrun.verdicts(text, big, src=str(SRC), log=log)
+                    sel -= {big[t] for t, x in v.items() if x == "pass"}
+                except Exception as e:
+                    log(patch.stem, "bigrun error", repr(e))
         except Exception as e:  # never crash: fall back to everything
             log(patch.stem, "ERROR", repr(e))
             sel, why = set(s.all_tests), []

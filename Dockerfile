@@ -7,6 +7,7 @@ COPY requirements.lock /app/requirements.lock
 RUN pip install --no-cache-dir -r /app/requirements.lock
 COPY selector.py /app/selector.py
 COPY maps /app/maps
+COPY tools/bigrun.py tools/bigchecks.py /app/tools/
 RUN chmod -R a+rX /app /sqlglot
 ENV PYTHONPATH=/sqlglot SKIP_INTEGRATION=0 PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]

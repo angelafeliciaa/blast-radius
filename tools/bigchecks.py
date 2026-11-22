@@ -61,7 +61,11 @@ class _Timeout(Exception):
 
 
 class _limit:
-    """Raise _Timeout in the block after `seconds` of wall time (main thread only)."""
+    """Raise _Timeout in the block after `seconds` of this process's CPU time.
+
+    CPU time, not wall time: on a busy two-core box a wall clock would fail
+    healthy code. Main thread only; elsewhere it does nothing.
+    """
 
     def __init__(self, seconds: float) -> None:
         self.seconds = seconds
@@ -72,16 +76,16 @@ class _limit:
 
     def __enter__(self):
         try:
-            self.old = signal.signal(signal.SIGALRM, self._fire)
-            signal.setitimer(signal.ITIMER_REAL, self.seconds)
+            self.old = signal.signal(signal.SIGPROF, self._fire)
+            signal.setitimer(signal.ITIMER_PROF, self.seconds)
         except ValueError:
             self.old = None
         return self
 
     def __exit__(self, *exc):
         if self.old is not None:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, self.old)
+            signal.setitimer(signal.ITIMER_PROF, 0)
+            signal.signal(signal.SIGPROF, self.old)
         return False
 
 
@@ -98,7 +102,7 @@ def check_max_nodes(root: str | None = None, changed=None, budget_s: float = 3.0
         from sqlglot import exp, parse_one
         from sqlglot.errors import ParseError
 
-        with _limit(max(budget_s, 2.0)):
+        with _limit(10.0):
             if not isinstance(parse_one("SELECT 1", max_nodes=1_000_000), exp.Select):
                 return FAIL
             cols = ",".join(f"col{i}" for i in range(500))
@@ -328,15 +332,18 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
 
     # Pass 1, cheap, every affected query: parse, transpile, plan. A query whose
     # plan is unchanged and whose execution does not run a touched line is done.
+    # The budget is checked against the PROJECTED total, so a check that cannot
+    # finish gives up after a query or two instead of burning the whole budget.
     start = time.process_time()
     heavy = []
-    for i in todo:
+    for k, i in enumerate(todo):
         rec = recorded[i]
         meta, sql, opt = pairs[i]
-        if time.process_time() - start > budget_s:
+        spent = time.process_time() - start
+        if k >= 3 and spent / k * len(todo) > budget_s:
             return UNKNOWN
         try:
-            with _limit(5.0):
+            with _limit(10.0):
                 expression = parse_one(sql)
                 if executes:  # the parent pickles every query for the pool
                     expression = pickle.loads(pickle.dumps(expression))
@@ -355,15 +362,27 @@ def _tpc(suite: str, changed, budget_s: float, executes: bool, optimized: bool) 
 
     # Pass 2: really execute what is left, cheapest first.
     heavy.sort(key=lambda x: x[:2])
+    left = sum(h[0] for h in heavy) / 1000  # recorded seconds still to execute
+    if left > budget_s:  # hopeless even at the recorded speed
+        return UNKNOWN
+    speed = 1.0  # CPU seconds here per recorded second, learned as we go
+    done_rec = done_cpu = 0.0
     for ms, i, names, plan in heavy:
-        if time.process_time() - start > budget_s:
+        spent = time.process_time() - start
+        if spent + left * speed > budget_s:
             return UNKNOWN
+        t0 = time.process_time()
         try:
-            with _limit(max(2.0, 10 * ms / 1000)):
+            with _limit(max(5.0, 20 * ms / 1000)):
                 if run_plan(suite, names, plan) != recorded[i]["res"]:
                     return FAIL
         except BaseException:
             return FAIL
+        left -= ms / 1000
+        done_rec += ms / 1000
+        done_cpu += time.process_time() - t0
+        if done_rec > 0.05:
+            speed = max(done_cpu / done_rec, 0.2)
     return PASS
 
 
