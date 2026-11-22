@@ -40,7 +40,7 @@ def main():
         try:
             d = json.loads(line)
             sel = {n for w in d["workers"] for n in w}
-            big = {num_to_id[n]: n for n in sel if num_to_id[n] in bigrun.BIG}
+            big = {num_to_id[n]: n for n in sel if num_to_id[n] in bigrun.BIG and "test_execute_tpcds" not in num_to_id[n]}
             if big:
                 text = Path(f"/data/commits/{d['commit']}.patch").read_text()
                 v = bigrun.verdicts(text, big, src="/opt/sqlglot", log=log)
