@@ -512,7 +512,13 @@ class Selector:
                 why.append(f"{path}: data -> {len(hits)}")
                 sel |= hits
             else:
-                why.append(f"{path}: ignored")
+                parts = Path(path).parts
+                hits = self.mentions(Path(path).name) | self.mentions(parts[0])
+                if path.startswith("sqlglot/"):
+                    # non-.py file inside the package (data, typing stubs)
+                    hits |= self.mentions(Path(path).stem)
+                why.append(f"{path}: other -> {len(hits)}")
+                sel |= hits
         return sel, why
 
     def split(self, nums: set[int]) -> list[list[int]]:
